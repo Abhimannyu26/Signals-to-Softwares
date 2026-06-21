@@ -1,18 +1,3 @@
-"""
-Q3B - Signals to Softwares
-Interactive music identifier built on the Q3A fingerprinting pipeline.
-
-Two modes:
-  * Single clip   : upload one clip, see the spectrogram, the constellation,
-                    the offset histogram and the prediction.
-  * Batch         : upload several clips, get a results.csv with exactly two
-                    columns (filename, prediction); filename has no extension.
-
-The song database is indexed once and cached. A pre-built index (db.pkl) is
-shipped with the app; if it is missing the app indexes everything under
-SONG_DIR on first run.
-"""
-
 import os
 import io
 import csv
@@ -24,77 +9,71 @@ import streamlit as st
 
 import fingerprint as fp
 
-SONG_DIR = os.environ.get("SONG_DIR", "songs")
-DB_PATH = "db.pkl"
+MUSIC_DIR = os.environ.get("SONG_DIR", "songs")
+INDEX_PATH = "db.pkl"
 
 st.set_page_config(page_title="Sonic Signatures", layout="wide")
 
 
-# ---------------------------------------------------------------------------
-# Database (built once, cached)
-# ---------------------------------------------------------------------------
 @st.cache_resource
-def get_database():
-    if os.path.exists(DB_PATH):
-        return fp.load_database(DB_PATH)
-    if not fp.list_audio(SONG_DIR):
+def fetch_db():
+    if os.path.exists(INDEX_PATH):
+        return fp.load_database(INDEX_PATH)
+    if not fp.list_audio(MUSIC_DIR):
         return {"db": {}, "names": [], "mode": "pairs"}
-    db = fp.build_database(SONG_DIR, mode="pairs")
-    fp.save_database(db, DB_PATH)
-    return db
+    song_db = fp.build_database(MUSIC_DIR, mode="pairs")
+    fp.save_database(song_db, INDEX_PATH)
+    return song_db
 
 
-def read_upload(uploaded):
-    """Decode an uploaded audio file to a mono waveform at fp.SR."""
+def load_clip(upload):
     import librosa
-    data = uploaded.read()
-    y, _ = librosa.load(io.BytesIO(data), sr=fp.SR, mono=True)
-    return y
+    raw = upload.read()
+    wave, _ = librosa.load(io.BytesIO(raw), sr=fp.SR, mono=True)
+    return wave
 
 
-def offsets_for(query_y, database):
-    """Per-song offset histograms for a query (for plotting)."""
-    qh = fp.fingerprint(query_y, mode=database["mode"])
-    per = defaultdict(Counter)
+def compute_offsets(wave, song_db):
+    qh = fp.fingerprint(wave, mode=song_db["mode"])
+    offsets = defaultdict(Counter)
     for h, tq in qh:
-        for sid, tdb in database["db"].get(h, ()):
-            per[database["names"][sid]][tdb - tq] += 1
-    return per, len(qh)
+        for idx, ts in song_db["db"].get(h, ()):
+            offsets[song_db["names"][idx]][ts - tq] += 1
+    return offsets, len(qh)
 
 
-# ---------------------------------------------------------------------------
-# Plot helpers
-# ---------------------------------------------------------------------------
-def plot_spectrogram(y):
-    S, freqs, times = fp.spectrogram(y)
+def draw_spectrogram(wave):
+    S, freq_axis, time_axis = fp.spectrogram(wave)
     fig, ax = plt.subplots(figsize=(7, 3))
-    ax.pcolormesh(times, freqs, fp.spectrogram_db(S),
+    ax.pcolormesh(time_axis, freq_axis, fp.spectrogram_db(S),
                   cmap="magma", vmin=-80, vmax=0, shading="auto")
-    ax.set_xlabel("time (s)"); ax.set_ylabel("frequency (Hz)")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("frequency (Hz)")
     ax.set_title("Spectrogram of the query clip")
     fig.tight_layout()
     return fig
 
 
-def plot_constellation(y):
-    S, freqs, times = fp.spectrogram(y)
-    t_idx, f_idx = fp.find_peaks(S)
+def draw_constellation(wave):
+    S, freq_axis, time_axis = fp.spectrogram(wave)
+    ti, fi = fp.find_peaks(S)
     fig, ax = plt.subplots(figsize=(7, 3))
-    ax.pcolormesh(times, freqs, fp.spectrogram_db(S),
+    ax.pcolormesh(time_axis, freq_axis, fp.spectrogram_db(S),
                   cmap="magma", vmin=-80, vmax=0, shading="auto")
-    ax.scatter(times[t_idx], freqs[f_idx], s=12, facecolors="none",
+    ax.scatter(time_axis[ti], freq_axis[fi], s=12, facecolors="none",
                edgecolors="cyan", linewidths=0.7)
-    ax.set_xlabel("time (s)"); ax.set_ylabel("frequency (Hz)")
-    ax.set_title("Constellation (%d peaks)" % len(t_idx))
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("frequency (Hz)")
+    ax.set_title("Constellation (%d peaks)" % len(ti))
     fig.tight_layout()
     return fig
 
 
-def plot_offset_hist(per, best):
+def draw_offsets(offsets, pred):
     fig, ax = plt.subplots(figsize=(7, 3))
-    if best and best in per:
-        h = per[best]
-        ax.bar(list(h.keys()), list(h.values()), width=1.0, color="tab:green")
+    if pred and pred in offsets:
+        h = offsets[pred]
+        ax.vlines(list(h.keys()), 0, list(h.values()), color="tab:green", linewidth=1.3)
     ax.set_xlabel("time offset (frames)")
     ax.set_ylabel("matching hashes")
     ax.set_title("Offset histogram for the predicted song")
@@ -102,72 +81,68 @@ def plot_offset_hist(per, best):
     return fig
 
 
-# ---------------------------------------------------------------------------
-# UI
-# ---------------------------------------------------------------------------
 st.title("Sonic Signatures - audio fingerprint identifier")
 
-db = get_database()
+song_db = fetch_db()
 st.caption("Indexed library: %d songs - %s"
-           % (len(db["names"]), ", ".join(db["names"]) if db["names"] else "(empty)"))
+           % (len(song_db["names"]), ", ".join(song_db["names"]) if song_db["names"] else "(empty)"))
 
-if not db["names"]:
+if not song_db["names"]:
     st.error("No songs are indexed. Set SONG_DIR to the song folder, or ship a db.pkl.")
     st.stop()
 
-mode = st.sidebar.radio("Mode", ["Single clip", "Batch"])
+ui_mode = st.sidebar.radio("Mode", ["Single clip", "Batch"])
 
-if mode == "Single clip":
-    up = st.file_uploader("Upload a query clip",
-                          type=["wav", "mp3", "flac", "ogg", "m4a"])
-    if up is not None:
-        y = read_upload(up)
-        st.audio(up)
+if ui_mode == "Single clip":
+    upload = st.file_uploader("Upload a query clip",
+                              type=["wav", "mp3", "flac", "ogg", "m4a"])
+    if upload is not None:
+        wave = load_clip(upload)
+        st.audio(upload)
 
-        best, scores, _ = fp.match(y, db)
-        if best is None:
+        pred, match_scores, _ = fp.match(wave, song_db)
+        if pred is None:
             st.warning("No match found - the clip produced no overlapping hashes.")
         else:
-            ranked = sorted(scores.items(), key=lambda kv: -kv[1])
-            runner = ranked[1][1] if len(ranked) > 1 else 0
-            st.success("Prediction: **%s**  (score %d)" % (best, scores[best]))
-            st.write("Score margin over the runner-up: %d vs %d"
-                     % (scores[best], runner))
+            ranking = sorted(match_scores.items(), key=lambda kv: -kv[1])
+            runner_up = ranking[1][1] if len(ranking) > 1 else 0
+            st.success("Prediction: **%s**  (score %d)" % (pred, match_scores[pred]))
+            st.write("Score margin over the runner-up: %d vs %d" % (match_scores[pred], runner_up))
 
-        per, nq = offsets_for(y, db)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.pyplot(plot_spectrogram(y))
-            st.pyplot(plot_offset_hist(per, best))
-        with c2:
-            st.pyplot(plot_constellation(y))
-            if scores:
+        offsets, nhashes = compute_offsets(wave, song_db)
+        left, right = st.columns(2)
+        with left:
+            st.pyplot(draw_spectrogram(wave))
+            st.pyplot(draw_offsets(offsets, pred))
+        with right:
+            st.pyplot(draw_constellation(wave))
+            if match_scores:
                 st.write("Top candidates")
-                st.table({"song": [r[0] for r in ranked[:5]],
-                          "score": [r[1] for r in ranked[:5]]})
+                st.table({"song": [r[0] for r in ranking[:5]],
+                          "score": [r[1] for r in ranking[:5]]})
 
-elif mode == "Batch":
+elif ui_mode == "Batch":
     st.write("Upload several clips. The app writes `results.csv` with two "
              "columns: `filename`, `prediction` (filename without extension).")
-    ups = st.file_uploader("Upload query clips",
-                           type=["wav", "mp3", "flac", "ogg", "m4a"],
-                           accept_multiple_files=True)
-    if ups:
-        rows = []
-        prog = st.progress(0.0)
-        for i, up in enumerate(ups):
-            y = read_upload(up)
-            best, _, _ = fp.match(y, db)
-            stem = os.path.splitext(os.path.basename(up.name))[0]
-            rows.append((stem, best if best is not None else ""))
-            prog.progress((i + 1) / len(ups))
+    uploads = st.file_uploader("Upload query clips",
+                               type=["wav", "mp3", "flac", "ogg", "m4a"],
+                               accept_multiple_files=True)
+    if uploads:
+        csv_rows = []
+        bar = st.progress(0.0)
+        for i, upload in enumerate(uploads):
+            wave = load_clip(upload)
+            pred, _, _ = fp.match(wave, song_db)
+            clip_name = os.path.splitext(os.path.basename(upload.name))[0]
+            csv_rows.append((clip_name, pred if pred is not None else ""))
+            bar.progress((i + 1) / len(uploads))
 
-        st.table({"filename": [r[0] for r in rows],
-                  "prediction": [r[1] for r in rows]})
+        st.table({"filename": [r[0] for r in csv_rows],
+                  "prediction": [r[1] for r in csv_rows]})
 
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["filename", "prediction"])
-        w.writerows(rows)
-        st.download_button("Download results.csv", buf.getvalue(),
+        out_buf = io.StringIO()
+        writer = csv.writer(out_buf)
+        writer.writerow(["filename", "prediction"])
+        writer.writerows(csv_rows)
+        st.download_button("Download results.csv", out_buf.getvalue(),
                            file_name="results.csv", mime="text/csv")
